@@ -20,4 +20,5 @@ multicast.o: multicast.c multicast.h
 	$(CC) $(CFLAGS) -c multicast.c -o multicast.o
 
 clean:
-	rm -f sender receiver *.o
+	rm -f sender receiver *.o 
+	rm -rf receiver_*

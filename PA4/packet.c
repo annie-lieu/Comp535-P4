@@ -3,25 +3,24 @@
 #include "packet.h"
 
 
-uint32_t checksum(const unsigned char *data, size_t len){
-    // CRC-32 implementation
+uint8_t checksum(const unsigned char *data, size_t len)
+{
+    uint8_t rem = 0;
+    const int rem_len = 8 * sizeof(uint8_t);         
+    const uint8_t msb_mask = 1 << (rem_len - 1);        
+    const uint8_t generator = 0x07;                
 
-    uint32_t generator = 0x04C11DB7;
-    uint8_t rem = 0;	
-    uint8_t topbit = 8 * sizeof(uint8_t) - 1;
+    // processing byte by byte
+    for (int byte = 0; byte < len; ++byte) {
 
+        // simulates bringing down the next byte in long div
+        rem ^= (data[byte] << (rem_len - 8));
 
-    // long division by byte
-    for (int i = 0; i < len; ++i)
-    {
-        // brings down the next byte in long division step
-        rem ^= (data[i] << (7 * sizeof(uint8_t)));
-
-        // long division by bit
-        for (uint8_t j = 8; j > 0; --j)
+        // processing bit by bit
+        for (uint8_t bit = 8; bit > 0; --bit)
         {
-            // try to divide the current bit
-            if (rem & topbit) {
+            // simulating XOR
+            if (rem & msb_mask) {
                 rem = (rem << 1) ^ generator;
             }
             else {
@@ -30,6 +29,5 @@ uint32_t checksum(const unsigned char *data, size_t len){
         }
     }
 
-    
-    return (rem);
-};
+    return rem;
+}

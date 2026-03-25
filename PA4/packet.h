@@ -21,8 +21,8 @@ typedef struct packet_t {
 typedef struct DataPacket{
     int file_id;
     int chunk_no;
-    uint32_t checksum;
-    int data_size; // just to know how much bytes is stored in data (up to given chunk input)
+    uint8_t checksum;
+    size_t data_size; // just to know how much bytes is stored in data (up to given chunk input)
     unsigned char data[];
 
 } DataPacket;
@@ -46,6 +46,6 @@ typedef struct Ack{
 
 } Ack;
 
-uint32_t checksum(const char *data, size_t len);
+uint8_t checksum(const unsigned char *data, size_t len);
 
 #endif
