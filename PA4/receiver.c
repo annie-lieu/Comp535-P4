@@ -25,8 +25,6 @@ ControlPacket *cur_file_info;
 // SUMMARY OF TODO:
 // - implement retransmission --> requesting missing chunks + files, and handling + sending ACKs
 // - implement closing the program
-// - debug all of the functions in receiver.c (need to fix packet receiving bug first)
-//       --> all of sender's current functions are debugged
 
 
 // handles asking for files sent before receiver could join
@@ -98,13 +96,12 @@ int write_file(){
 // verify integrity, accept or reject file..
 void verify_chunk(DataPacket *pkt){
 
-    // check if we already receieve this packet before
+    // get the chunk's file buffer location
     int idx = pkt->chunk_no * cur_file_info->chunk_size;
 
-    if (file_buf[idx] == '\0'){
-        // ignore any duplicate chunks
+    // check if we already written to this location before (received duplicate chunk)
+    if (file_buf[idx] != '\0'){
         printf("DEBUGING: Have %c at idx %d\n", file_buf[idx], idx);
-        free(pkt);
         return;
     }
 
@@ -112,7 +109,7 @@ void verify_chunk(DataPacket *pkt){
     uint8_t calc_chksum = checksum(pkt->data, pkt->data_size);
 
     printf("~~~~~~~~~~~~~~~DEBUGING~~~~~~~~~~~~~~~~~~\n");
-    printf("Got file %d, chunk %d with %s\n", pkt->file_id ,pkt->chunk_no,pkt->data);
+    printf("Got file %d, chunk %d with data: %s\n", pkt->file_id ,pkt->chunk_no,pkt->data);
     printf("Calculated: %d\n", calc_chksum);
     printf("sent: %d\n", pkt->checksum);
     printf("~~~~~~~~~~~~~~~~~END~~~~~~~~~~~~~~~~~~\n");
@@ -128,7 +125,7 @@ void verify_chunk(DataPacket *pkt){
 
             // TODO:
             if (file_verified){
-                // free control packet to move onto the next file
+                // free the current control packet to move onto the next file
                 free(cur_file_info);
 
 
@@ -151,20 +148,19 @@ void verify_chunk(DataPacket *pkt){
     }
 
 
-    // no longer need packet --> free it
-    free(pkt);
+    
     
 }
 
 void listener(mcast_t* mcast){
     // set 10KB as the packet size limit
     int max_payload = 10000;
+    packet_t* pkt = calloc(1, sizeof(packet_t) + max_payload);
 
     while(1){
-        packet_t* pkt = calloc(1, sizeof(packet_t) + max_payload);
 
         if (multicast_check_receive(mcast) > 0) {
-            multicast_receive(mcast, pkt, sizeof(pkt));
+            multicast_receive(mcast, pkt, sizeof(packet_t) + max_payload); // wrong receiver buffer size --> fixed so debug everything else
 
             printf("DEBUGING: got something\n");
 
@@ -177,16 +173,19 @@ void listener(mcast_t* mcast){
 
                         printf("No control packet --> exit program for now\n");
                         multicast_destroy(mcast);
-                        break;
+                        free(pkt);
+                        return;
 
                     } else {
                         // proceed with checking the chunk
                         verify_chunk((DataPacket *) pkt->payload);
+
                     }
                     break;
                 case CTRL:
                     // save the current file info
-                    cur_file_info = (ControlPacket *) pkt->payload;
+                    cur_file_info = calloc(1,sizeof(ControlPacket) + 2000);
+                    memcpy(cur_file_info, pkt->payload, sizeof(ControlPacket) + 2000);
 
 
                     printf("~~~~~~~~~~~~~~~DEBUGING~~~~~~~~~~~~~~~~~~\n");
@@ -207,6 +206,9 @@ void listener(mcast_t* mcast){
 
                     
             }
+
+            // finished processing the packet --> reset it to receive the next packet
+            memset(pkt, '\0', sizeof(packet_t) + max_payload);   
 
         }
     }
