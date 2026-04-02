@@ -1,8 +1,11 @@
 #include <stdio.h> 
 #include <stdlib.h>    
 #include <string.h>
+#include <stdbool.h>
 #include <unistd.h>
 #include "multicast.h"
+#include <time.h>
+#include <sys/stat.h>
 #include "packet.h"
 
 // counts the current number of receivers in the multicast
@@ -17,42 +20,27 @@ int receiver_num = 0;
 //                                 --> when a receiver receives all files, it can ACK sender back and disconnect (update receiver_num)
 // - track statistics about transmission
 
+bool is_id_in_list(int *list, int count, int id);
+void send_chunk(int chunk_no, DataPacket **pkts, mcast_t *mcast, packet_t *envelope);
 
+long get_file_size(const char *filename);
+int calculate_chunks(long fsize, int csize);
 
-// determines how large a file's buffer should be
-int file_buf_size(int csize, FILE* fptr){
-    
-    // go to the end of the file
-    fseek(fptr, 0L, SEEK_END);
-
-    // get size of the file
-    long fsize = ftell(fptr);
-
-    // close the file
-    fclose(fptr);
-
-    // calculate the total chunks needed --> ceiling(fsize/csize)
-    int tot = (int) fsize/csize + (fsize % csize != 0);
-
-    return tot;
-
-}
 
 // function for spliting a file into chunks and packaging them into DataPackets
 DataPacket** chunk_file(int csize, int tot_chunk, int fid, const char* fname){
     // create the buffer to hold the packets
-    DataPacket **data_pkts = calloc(csize, sizeof(DataPacket*));
+    DataPacket **data_pkts = calloc(tot_chunk, sizeof(DataPacket*));
 
     // open the file
     FILE* fptr = fopen(fname, "rb");
 
-    // just an extra check
     if (!fptr) {
         perror(">> File opening error occured - Will not multicast file");
         return NULL;
     }
 
-
+    rewind(fptr);
     for (int i = 0; i < tot_chunk; i++){
         // create a buffer to store the chunk in
         unsigned char *buf = calloc(1, csize);
@@ -108,12 +96,19 @@ void send_file(int tot_files, int fid, int tot_chunk, int csize, char* fname,
 
     // create the control packet to dictate the shape of this file
     long ctrl_len = sizeof(ControlPacket) + strlen(fname) + 1;
+    long fsize = get_file_size(fname);
     ControlPacket *c = calloc(1, ctrl_len);
     c->tot_files = tot_files;
     c->file_id = fid;
     c->tot_chunk = tot_chunk;
     c->chunk_size = csize;
-    strcpy(c->file_name, fname);
+    c->file_size = fsize;
+    // get absolute path name
+    const char *pure_name = strrchr(fname, '/');
+    if (pure_name) pure_name++;
+    else pure_name = fname;
+
+    strcpy(c->file_name, pure_name);
 
     // wrap the control packet in a shell
     packet_t *meta_package = malloc(sizeof(packet_t) + ctrl_len);
@@ -121,52 +116,149 @@ void send_file(int tot_files, int fid, int tot_chunk, int csize, char* fname,
     memcpy(meta_package->payload, c, ctrl_len);
 
     // send the intial control packet
+    multicast_send(mcast, meta_package, sizeof(packet_t) + ctrl_len);    
+
+    int max_ack_size = sizeof(packet_t) + sizeof(Ack) + 100;
+    packet_t *recv_pkt = malloc(max_ack_size); 
+
+    receiver_num = 0; 
+    // Simple array to track unique IDs
+    int *discovered_ids = calloc(1024, sizeof(int)); 
+    memset(discovered_ids, 0, 1024 * sizeof(int));
+
+    printf(">> Discovery Phase: Sending Control packet...\n");
+    
+    // Send CTRL packet
     multicast_send(mcast, meta_package, sizeof(packet_t) + ctrl_len);
 
-
-    // free the shell
-    free(meta_package);
-
-
-    //TODO: check if all current receivers (receiver_num) got the control packet 
-    
-
+    // Wait and listen for JOIN_ACKS
+    time_t start_time = time(NULL);
+    // Wait 2 seconds for everyone to check in
+    while (time(NULL) - start_time < 2) { 
+        if (multicast_check_receive(mcast) > 0) {
+            multicast_receive(mcast, recv_pkt, 1000);
+            Ack *in = (Ack*)recv_pkt->payload;
+            
+            if (in->ack_type == 5) {
+                if (!is_id_in_list(discovered_ids, receiver_num, in->originator_id)) {
+                    discovered_ids[receiver_num] = in->originator_id;
+                    receiver_num++;
+                    printf("Found Receiver ID: %d (Total: %d)\n", in->originator_id, receiver_num);
+                }
+            }
+        }
+    }
 
     // sending the data packets (sucessfully sent control packet)
     int cur_idx = 0; // min seq chunk to send
 
-    while (cur_idx < tot_chunk){
-        printf("~~~~~~~~~~~~~~~DEBUGING~~~~~~~~~~~~~~~~~~\n");
-        printf("sending chunk %d \n", cur_idx);
-        printf("struct size %ld \n", sizeof(DataPacket));
-        printf("data size %ld \n", pkts[cur_idx]->data_size);
-        printf("~~~~~~~~~~~~~~~~~END~~~~~~~~~~~~~~~~~~\n");
+    int finished_count = 0;
+    int finished_receivers[1024] = {0};
+    int max_data_pkt_size = sizeof(packet_t) + sizeof(DataPacket) + csize;
+    packet_t *envelope = malloc(max_data_pkt_size);
 
-        // put the data into a shell
-        long payload_len = sizeof(DataPacket) + pkts[cur_idx]->data_size;
-        packet_t *package = malloc(sizeof(packet_t) + payload_len);
-        package->type = DATA;
-        memcpy(package->payload, pkts[cur_idx], payload_len);
+    // 1. Create the inner payload (The Signal)
+    Ack eof_signal;
+    eof_signal.ack_type = 9;         
+    eof_signal.originator_id = 0;
+    // Helpful for receivers to verify the goal    
+    eof_signal.ack_no = tot_chunk;  
 
-        // sending
-        multicast_send(mcast, package, sizeof(packet_t) + payload_len);
+    // 2. Wrap it in the packet_t shell
+    packet_t *p_eof = malloc(sizeof(packet_t) + sizeof(Ack));
+    p_eof->type = ACKN;            
+    memcpy(p_eof->payload, &eof_signal, sizeof(Ack));
 
-        // no longer need this outer shell
-        free(package);
+    // Size to send
+    int eof_size = sizeof(packet_t) + sizeof(Ack);
 
+    // loop until All receivers finished receiving current file
+    while (finished_count < receiver_num) {
+        
+        // If we still have new chunks to send, send one
+        if (cur_idx < tot_chunk) {
+            printf("~~~~~~~~~~~~~~~DEBUGING~~~~~~~~~~~~~~~~~~\n");
+            printf("sending chunk %d \n", cur_idx);
+            printf("struct size %ld \n", sizeof(DataPacket));
+            printf("data size %ld \n", pkts[cur_idx]->data_size);
+            printf("~~~~~~~~~~~~~~~~~END~~~~~~~~~~~~~~~~~~\n");
+            send_chunk(cur_idx, pkts, mcast, envelope);
+            cur_idx++;
+        } else {
+            // We finished the file, now just heartbeat until everyone is done
+            multicast_send(mcast, p_eof, eof_size); 
+            usleep(100000); 
+        }
 
-        // wait for ACK and retransmit as needed (update cur_idx accordingly)
-        cur_idx++; // temporary line since missing above implementation
+        // Check for ANY incoming ACKs (NACKs or FINISHED)
+        while (multicast_check_receive(mcast) > 0) {
+            multicast_receive(mcast, recv_pkt, max_ack_size);
+            Ack *in = (Ack*)recv_pkt->payload;
 
-        // --> if we gotten ACKs from everyone => cur_idx = min(all ACKs received)
-        // --> if we haven't received ACKs from all receivers => cur_idx = min(cur_idx, min of all ACKs received)
+            if (in->ack_type == 1) { // NACK
+                send_chunk(in->ack_no, pkts, mcast, envelope);
+            } 
+            else if (in->ack_type == 2) { // FINISHED
+                if (is_id_in_list(discovered_ids, receiver_num, in->originator_id) && 
+                    finished_receivers[in->originator_id] == 0) {
+                    finished_receivers[in->originator_id] = 1;
+                    finished_count++;
+                    printf("Receiver %d finished (%d/%d)\n", in->originator_id, finished_count, receiver_num);
+                }
+            }
+            else if (in->ack_type == 3) { // REQUEST_CTRL (Late Joiner)
+                // 1. Send the Control Packet so they can initialize
+                multicast_send(mcast, meta_package, sizeof(packet_t) + ctrl_len);
 
-
-        // currently sends packets one at a time.. (maybe change implementation to send more at a time?)
-
+                // Check if we already know this person
+                if (!is_id_in_list(discovered_ids, receiver_num, in->originator_id)) {
+                    discovered_ids[receiver_num] = in->originator_id;
+                    receiver_num++; 
+                    printf("Late Joiner Registered: ID %d (New Total: %d)\n", 
+                            in->originator_id, receiver_num);
+                }
+            }
+        }
+        usleep(1000);
     }
 
-    return;
+    free(envelope);
+    free(meta_package);
+    free(recv_pkt);
+}
+
+// send chunk (dont keep malloc and freeing packet_t)
+void send_chunk(int chunk_no, DataPacket **pkts, mcast_t *mcast, packet_t *envelope) {
+    long payload_len = sizeof(DataPacket) + pkts[chunk_no]->data_size;
+    envelope->type = DATA;
+    memcpy(envelope->payload, pkts[chunk_no], payload_len);
+    multicast_send(mcast, envelope, sizeof(packet_t) + payload_len);
+    
+}
+
+// return true if id is in list
+bool is_id_in_list(int *list, int count, int id){
+
+    for(int i = 0; i < count; i ++){
+        if (list[i] == id){
+            return true;
+        }
+    }
+    return false;
+
+}
+
+long get_file_size(const char *filename) {
+    struct stat st;
+    if (stat(filename, &st) == 0) {
+        return st.st_size;
+    }
+    return -1; // Error case
+}
+
+int calculate_chunks(long fsize, int csize) {
+    if (fsize <= 0) return 0;
+    return (int)((fsize + csize - 1) / csize);
 }
 
 
@@ -218,7 +310,8 @@ int main(int argc, char const* argv[]){
             printf(">> Chunking and processing file %s \n", argv[i]);
 
             // determine total number of chunks needed
-            file_len[tot_files] = file_buf_size(chunk_size,fptr);
+            long fsize = get_file_size(argv[i]);
+            file_len[tot_files] = calculate_chunks(fsize, chunk_size); // Calculate ONCE
 
             // create data packets for the file and store in memory 
             file_chunks[tot_files] = chunk_file(chunk_size, file_len[tot_files], tot_files, argv[i]);
@@ -234,7 +327,7 @@ int main(int argc, char const* argv[]){
                 filename = argv[i];
             }
 
-            files[tot_files] = strdup(filename);
+            files[tot_files] = strdup(argv[i]);
 
             // check if chunk_file() succeeded
             if (!file_chunks[tot_files]){
@@ -270,6 +363,7 @@ int main(int argc, char const* argv[]){
 
         // sending
         send_file(tot_files, i, file_len[i], chunk_size, files[i], file_chunks[i], cast);
+        sleep(2);
 
     }
 

@@ -28,21 +28,24 @@ typedef struct DataPacket{
 } DataPacket;
 
 // responsible for holding the metadata individual files + the total to be sent
+#pragma pack(push, 1)
 typedef struct ControlPacket{
     int tot_files; // allows late joiners to know if they missed entire files
     int file_id;
     int tot_chunk; // total number of chunks for file_name
     int chunk_size;
+    long file_size;
     // int file_checksum; --> could use to validate final file
     char file_name[];
 
 } ControlPacket;
+#pragma pack(pop)
 
 // responsible for confirmation between sender and reciever
 typedef struct Ack{
     int originator_id; // an id number to differentiate who sent this ack 
-    int ack_type; // can freely decide the kind of ack message to send --> for missing chunk, file, finished, etc.
-    int ack_no;
+    int ack_type; // 1 = NACK/RESEND, 2 = FINISHED, 3 = REQUEST_CTRL, 5 = JOIN_ACK, 9 = SENDER_FINISHED_SIGNAL
+    int ack_no; // packet missing
 
 } Ack;
 

@@ -2,8 +2,10 @@
 #include <stdlib.h>    
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #include "multicast.h"
 #include "packet.h"
+#include <time.h>
 
 char dir_name[] = "receiver_";
 
@@ -21,95 +23,92 @@ unsigned char *file_buf;
 // keep track of the current file info
 ControlPacket *cur_file_info;
 
+// receiver id
+int recv_id;
+// ABSOLUTE count of chunks received
+int chunks_count = 0;
+// bitmap of chunks received
+char *received_chunks;
+// track how many files in batch completed
+int files_completed;
+
 
 // SUMMARY OF TODO:
 // - implement retransmission --> requesting missing chunks + files, and handling + sending ACKs
 // - implement closing the program
 
-
+void send_nack(mcast_t* mcast, int chunk_no);
 // handles asking for files sent before receiver could join
 void request_file();
+void send_ack_to_sender(mcast_t* mcast, Ack a);
 
 // place chunk in correct position + update sequence number if needed
 void reassemble_file(DataPacket *pkt, int location){
 
-    printf("DEBUGING: writing into idx %d\n", location);
-
-
-    // copy the data into the correct location
-    memcpy(&file_buf[location], pkt->data, pkt->data_size);
-
-
-    // check if we need to update the sequence number
-    if (pkt->chunk_no == (seq_no + 1)){
-        // we can advance the sequence number by 1 (assuming sender only sends a new packet once everyone ACK'd)
-        // could modify sender to send up to n at a time
-        seq_no++;
+    if (received_chunks[pkt->chunk_no] == 0) {
+        
+        printf("DEBUGING: writing into idx %d\n", location);
+        memcpy(&file_buf[location], pkt->data, pkt->data_size);
+        
+        // Mark as received and increment the ABSOLUTE count
+        received_chunks[pkt->chunk_no] = 1;
+        chunks_count++;
+        
+        printf("DEBUG: Progress %d/%d\n", chunks_count, cur_file_info->tot_chunk);
     }
 
-    // check if we received all chunks
-    if (seq_no == (cur_file_info->tot_chunk-1)){
-        // finished --> set the write flag
+    // Check for completion
+    if (chunks_count == cur_file_info->tot_chunk) {
         write_flag = 1;
     }
 }
 
 
 int write_file(){
-    printf("DEBUGING: writing the file\n");
+   if (!file_buf) return 0;
 
-    int verified = 1; // NEED TO IMPLEMENT FINAL FILE VERIFICATION
+    printf("DEBUGING: writing %ld bytes to disk\n", cur_file_info->file_size);
 
-    if (verified){
-        // create the new file
-        char path[1024];
-        snprintf(path, sizeof(path), "%s/%s", dir_name, cur_file_info->file_name);
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/%s", dir_name, cur_file_info->file_name);
 
-        FILE* fptr = fopen(path, "wb");
-        if (!fptr){
-            perror(">> Something went wrong in writing the file");
-
-            // reject the file
-            return 0;
-        }
-
-        // write the file buffer
-        fwrite(file_buf, 1, strlen((const char *)file_buf), fptr);
-
-        // close the file
-        fclose(fptr);
-
-        // free buffer
-        free(file_buf);
+    FILE* fptr = fopen(path, "wb");
+    if (!fptr){
+        perror(">> Fopen error");
+        return 0;
     }
 
-    // reset write flag
-    write_flag = 0;
+    // Write and Flush
+    size_t written = fwrite(file_buf, 1, cur_file_info->file_size, fptr);
+    fflush(fptr);
+    fclose(fptr);
 
-    // let other functions know if we rejected or accepted the file
-    // --> useful to indicate if we need to request the whole file again
-    return verified;
+    printf("DEBUG: Successfully wrote %zu bytes\n", written);
+
+    // Clean buffer
+    free(file_buf);
+    file_buf = NULL; 
+    
+    write_flag = 0;
+    return 1;
 
     
 }
 
 // verify integrity, accept or reject file..
-void verify_chunk(DataPacket *pkt){
+void verify_chunk(DataPacket *pkt, mcast_t* mcast){
 
     // get the chunk's file buffer location
     int idx = pkt->chunk_no * cur_file_info->chunk_size;
 
     // check if we already written to this location before (received duplicate chunk)
-    if (file_buf[idx] != '\0'){
-        printf("DEBUGING: Have %c at idx %d\n", file_buf[idx], idx);
-        return;
-    }
+    if (received_chunks[pkt->chunk_no] == 1) return;
 
     // perform checksum calculation on the sent data
     uint8_t calc_chksum = checksum(pkt->data, pkt->data_size);
 
     printf("~~~~~~~~~~~~~~~DEBUGING~~~~~~~~~~~~~~~~~~\n");
-    printf("Got file %d, chunk %d with data: %s\n", pkt->file_id ,pkt->chunk_no,pkt->data);
+    printf("Got file %d, chunk %d:\n", pkt->file_id ,pkt->chunk_no);
     printf("Calculated: %d\n", calc_chksum);
     printf("sent: %d\n", pkt->checksum);
     printf("~~~~~~~~~~~~~~~~~END~~~~~~~~~~~~~~~~~~\n");
@@ -120,36 +119,90 @@ void verify_chunk(DataPacket *pkt){
         reassemble_file(pkt, idx);
 
         // if we ACKed all the chunks for this file..
-        if (write_flag){
-            int file_verified = write_file();
+        if (write_flag) {
+            if (file_buf != NULL) {
+                // Write the current file to disk
+                if (write_file()) { 
+                    
+                    // Prepare and send the finished ACK
+                    Ack final_ack;
+                    final_ack.originator_id = recv_id;
+                    final_ack.ack_type = 2;             
+                    final_ack.ack_no = cur_file_info->file_id; 
 
-            // TODO:
-            if (file_verified){
-                // free the current control packet to move onto the next file
-                free(cur_file_info);
+                    send_ack_to_sender(mcast, final_ack);
+                    printf("Sent FINISHED ACK for File %d.\n", cur_file_info->file_id);
 
-
-                // exit for now since implementation is incomplete
-                printf("exiting...\n");
-                exit(0);
-
-            } else {
-                // need to transmit the entire file + its control packet again
-                
+                    // Check if this was the last file in the sender's batch
+                    if (files_completed >= cur_file_info->tot_files) {
+                        printf("I have all %d files. Exiting.\n", files_completed);
+                        exit(0);
+                    } else {
+                        printf("Saved %d/%d files. Waiting for others...\n", files_completed, cur_file_info->tot_files);
+                        
+                        // Reset state to wait for the next file
+                        free(cur_file_info);
+                        cur_file_info = NULL;
+                        free(received_chunks);
+                        received_chunks = NULL;
+                        chunks_count = 0;
+                        write_flag = 0;
+                        
+                        printf("Ready for next file...\n");
+                    }
+                }
             }
         }
 
-        // SEND ACK HERE
-
     } else {
-        // RETRANSMIT IMPLMENTATION HERE
-        // since sender has a timeout, we could reduce network overhead by not sending back ACK
+        // send nack when gap detected or checksum fails
+
+        printf("Checksum failed for chunk %d! Sending NACK.\n", pkt->chunk_no);
+
+        send_nack(mcast, pkt->chunk_no);
+        return; 
 
     }
-
-
     
-    
+}
+
+// send nack to sender
+void send_nack(mcast_t* mcast, int chunk_no){
+
+    Ack nack;
+    nack.originator_id = recv_id; 
+    nack.ack_type = 1;           
+    nack.ack_no = chunk_no;
+
+    packet_t *p_out = malloc(sizeof(packet_t) + sizeof(Ack));
+    p_out->type = ACKN;
+    memcpy(p_out->payload, &nack, sizeof(Ack));
+
+    multicast_send(mcast, p_out, sizeof(packet_t) + sizeof(Ack));
+    free(p_out);
+    return;
+}
+
+// send ack to sender
+void send_ack_to_sender(mcast_t* mcast, Ack a){
+
+    packet_t *p_out = malloc(sizeof(packet_t) + sizeof(Ack));
+    p_out->type = ACKN;
+    memcpy(p_out->payload, &a, sizeof(Ack));
+    printf("DEBUG: Sending ACK type %d (ID: %d) to sender\n", a.ack_type, a.originator_id);
+    multicast_send(mcast, p_out, sizeof(packet_t) + sizeof(Ack));
+    free(p_out);
+}
+
+// find the first chunk that is missing
+int find_first_missing_chunk(){
+    int total = cur_file_info->tot_chunk;
+    for (int i = 0; i < total ; i++){
+        if (received_chunks[i] == 0){
+            return i;
+        }
+    }
+    return -1;
 }
 
 void listener(mcast_t* mcast){
@@ -169,47 +222,92 @@ void listener(mcast_t* mcast){
                 case DATA:
                     //check if we received the control packet
                     if (!file_buf){
-                        // missing control packet --> request (TODO)
 
-                        printf("No control packet --> exit program for now\n");
-                        multicast_destroy(mcast);
-                        free(pkt);
-                        return;
+                        // no buffer -> ask for ctrl packet from sender
+
+                        printf("Received data but missing Control Packet. Requesting...\n");
+                        
+                        Ack nack;
+                        nack.originator_id = recv_id;
+                        nack.ack_type = 3;
+                        
+                        send_ack_to_sender(mcast, nack);
 
                     } else {
                         // proceed with checking the chunk
-                        verify_chunk((DataPacket *) pkt->payload);
+                        verify_chunk((DataPacket *) pkt->payload, mcast);
 
                     }
                     break;
                 case CTRL:
-                    // save the current file info
-                    cur_file_info = calloc(1,sizeof(ControlPacket) + 2000);
-                    memcpy(cur_file_info, pkt->payload, sizeof(ControlPacket) + 2000);
 
+                    ControlPacket *incoming = (ControlPacket*)pkt->payload;
 
-                    printf("~~~~~~~~~~~~~~~DEBUGING~~~~~~~~~~~~~~~~~~\n");
-                    printf("Control info:\n");
-                    printf("total files: %d\n", cur_file_info->tot_files);
-                    printf("cur file: %d\n", cur_file_info->file_id);
-                    printf("total chunks: %d\n", cur_file_info->tot_chunk);
-                    printf("chunk size: %d\n", cur_file_info->chunk_size);
-                    printf("file name: %s\n", cur_file_info->file_name);
-                    printf("~~~~~~~~~~~~~~~~~END~~~~~~~~~~~~~~~~~~\n");
+                    // SCENARIO: No buffer OR it's a brand new File ID
+                    if (file_buf == NULL || (cur_file_info != NULL && incoming->file_id > cur_file_info->file_id)) { 
+                        
+                        // If we had a buffer from a previous file that didn't finish, clean it up first
+                        if (file_buf != NULL) {
+                            free(file_buf);
+                            free(received_chunks);
+                            free(cur_file_info);
+                        }
+
+                        // Initialize new file metadata
+                        cur_file_info = calloc(1, sizeof(ControlPacket) + 256);
+                        memcpy(cur_file_info, pkt->payload, sizeof(ControlPacket) + 256);
+
+                        printf("Starting File %d/%d: %s\n", 
+                                cur_file_info->file_id + 1, 
+                                cur_file_info->tot_files, 
+                                cur_file_info->file_name);
+
+                        file_buf = (unsigned char *)calloc(cur_file_info->tot_chunk, cur_file_info->chunk_size); 
+                        received_chunks = calloc(cur_file_info->tot_chunk, sizeof(char));
+                        chunks_count = 0; 
+                        write_flag = 0;
+
+                        printf("~~~~~~~~~~~~~~~DEBUGING~~~~~~~~~~~~~~~~~~\n");
+                        printf("Control info:\n");
+                        printf("total files: %d\n", cur_file_info->tot_files);
+                        printf("cur file: %d\n", cur_file_info->file_id);
+                        printf("total chunks: %d\n", cur_file_info->tot_chunk);
+                        printf("chunk size: %d\n", cur_file_info->chunk_size);
+                        printf("file name: %s\n", cur_file_info->file_name);
+                        printf("~~~~~~~~~~~~~~~~~END~~~~~~~~~~~~~~~~~~\n");
+                    } 
                     
-                    // initalize the file buffer (should be null during intialization)
-                    file_buf = (unsigned char *)calloc(cur_file_info->tot_chunk, cur_file_info->chunk_size); 
-
+                    // SCENARIO: Always send the JOIN_ACK to keep sender happy whether new file or heartbeat
+                    Ack join_ack = { .originator_id = recv_id, .ack_type = 5, .ack_no = incoming->file_id };
+                    send_ack_to_sender(mcast, join_ack);
                     break;
-                case ACKN: // TODO
+                case ACKN: 
                     // the sender has information for the receiver (e.g. finished transmiting and want to shutdown)
+                    Ack *in_signal = (Ack*)pkt->payload;
 
+                    if (in_signal->ack_type == 9) { // Sender says they are done
+                        if (chunks_count == (cur_file_info->tot_chunk)) {
+                            // every chunk recieved
+                            Ack done;
+                            done.originator_id = recv_id;
+                            done.ack_type = 2; 
+                            
+                            // send done packet back to sender
+                            send_ack_to_sender(mcast, done); 
+                            
+                            // Trigger the file write if not already done
+                            write_flag = 1; 
+                        } else {
+                            // missing chunk -> request chunk
+
+                            send_nack(mcast, find_first_missing_chunk());
+                        }
+                    }
+                    break;
                     
             }
-
             // finished processing the packet --> reset it to receive the next packet
             memset(pkt, '\0', sizeof(packet_t) + max_payload);   
-
         }
     }
 
@@ -219,6 +317,7 @@ void listener(mcast_t* mcast){
 
 
 int main(int argc, char const* argv[]){
+    files_completed = 0;
 
     if (argc <= 1){
         printf(">> Error: receiver.c requires a positive integer for identification\n");
@@ -227,7 +326,7 @@ int main(int argc, char const* argv[]){
 
     // get the id number
     char* end;
-    int recv_id = strtol(argv[1], &end, 10);
+    recv_id = strtol(argv[1], &end, 10);
     if (*end != '\0' || recv_id <= 0){
         printf(">> Error: The id argument requires a positive integer\n");
         return 2;
