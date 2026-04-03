@@ -47,14 +47,14 @@ void reassemble_file(DataPacket *pkt, int location){
 
     if (received_chunks[pkt->chunk_no] == 0) {
         
-        printf("DEBUGING: writing into idx %d\n", location);
+        //printf("DEBUGING: writing into idx %d\n", location);
         memcpy(&file_buf[location], pkt->data, pkt->data_size);
         
         // Mark as received and increment the ABSOLUTE count
         received_chunks[pkt->chunk_no] = 1;
         chunks_count++;
         
-        printf("DEBUG: Progress %d/%d\n", chunks_count, cur_file_info->tot_chunk);
+        //printf("DEBUG: Progress %d/%d\n", chunks_count, cur_file_info->tot_chunk);
     }
 
     // Check for completion
@@ -67,7 +67,7 @@ void reassemble_file(DataPacket *pkt, int location){
 int write_file(){
    if (!file_buf) return 0;
 
-    printf("DEBUGING: writing %ld bytes to disk\n", cur_file_info->file_size);
+    //printf("DEBUGING: writing %ld bytes to disk\n", cur_file_info->file_size);
 
     char path[1024];
     snprintf(path, sizeof(path), "%s/%s", dir_name, cur_file_info->file_name);
@@ -107,11 +107,13 @@ void verify_chunk(DataPacket *pkt, mcast_t* mcast){
     // perform checksum calculation on the sent data
     uint8_t calc_chksum = checksum(pkt->data, pkt->data_size);
 
+    /*
     printf("~~~~~~~~~~~~~~~DEBUGING~~~~~~~~~~~~~~~~~~\n");
     printf("Got file %d, chunk %d:\n", pkt->file_id ,pkt->chunk_no);
     printf("Calculated: %d\n", calc_chksum);
     printf("sent: %d\n", pkt->checksum);
     printf("~~~~~~~~~~~~~~~~~END~~~~~~~~~~~~~~~~~~\n");
+    */
 
     // determine if the chunk is corrupted + haven't receive this chunk yet
     if (calc_chksum == pkt->checksum){
@@ -216,7 +218,7 @@ void listener(mcast_t* mcast){
         if (multicast_check_receive(mcast) > 0) {
             multicast_receive(mcast, pkt, sizeof(packet_t) + max_payload); // wrong receiver buffer size --> fixed so debug everything else
 
-            printf("DEBUGING: got something\n");
+            //printf("DEBUGING: got something\n");
 
             // parse packet type
             switch(pkt->type) {
@@ -283,6 +285,7 @@ void listener(mcast_t* mcast){
                         chunks_count = 0; 
                         write_flag = 0;
 
+                        /*
                         printf("~~~~~~~~~~~~~~~DEBUGING~~~~~~~~~~~~~~~~~~\n");
                         printf("Control info:\n");
                         printf("total files: %d\n", cur_file_info->tot_files);
@@ -291,6 +294,7 @@ void listener(mcast_t* mcast){
                         printf("chunk size: %d\n", cur_file_info->chunk_size);
                         printf("file name: %s\n", cur_file_info->file_name);
                         printf("~~~~~~~~~~~~~~~~~END~~~~~~~~~~~~~~~~~~\n");
+                        */
                     } 
                     
                     // SCENARIO: Always send the JOIN_ACK to keep sender happy whether new file or heartbeat

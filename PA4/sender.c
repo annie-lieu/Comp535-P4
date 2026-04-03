@@ -29,6 +29,8 @@ void send_chunk(int chunk_no, DataPacket **pkts, mcast_t *mcast, packet_t *envel
 long get_file_size(const char *filename);
 int calculate_chunks(long fsize, int csize);
 
+long total_packets_sent = 0;
+
 
 // function for spliting a file into chunks and packaging them into DataPackets
 DataPacket** chunk_file(int csize, int tot_chunk, int fid, const char* fname){
@@ -64,12 +66,13 @@ DataPacket** chunk_file(int csize, int tot_chunk, int fid, const char* fname){
         // reading the file
         size_t data_size = fread(buf, 1, csize, fptr);
 
-        //printf("Read: \n|||%s|||\n",buf);
+        /*
+        printf("Read: \n|||%s|||\n",buf);
         printf("~~~~~~~~~~~~~~~DEBUGING~~~~~~~~~~~~~~~~~~\n");
         printf("size: %ld \n",data_size);
         printf("chunkno: %d \n",i);
         printf("fid: %d \n",fid);
-        
+        */
 
         // create the data packet
         data_pkts[i] = calloc(1,sizeof(DataPacket) + data_size);
@@ -79,8 +82,9 @@ DataPacket** chunk_file(int csize, int tot_chunk, int fid, const char* fname){
         data_pkts[i]->data_size = data_size;
         memcpy(data_pkts[i]->data, buf, data_size);
 
-        printf("checksum: %d \n",data_pkts[i]->checksum);
-        printf("~~~~~~~~~~~~~~~~~END~~~~~~~~~~~~~~~~~~\n");
+        
+        //printf("checksum: %d \n",data_pkts[i]->checksum);
+        //printf("~~~~~~~~~~~~~~~~~END~~~~~~~~~~~~~~~~~~\n");
         // maybe checksum should include other file headers to ensure no corruptions for fields
     }
 
@@ -113,7 +117,7 @@ int get_bit_index(int id, int *list) {
 void send_file(int tot_files, int fid, int tot_chunk, int csize, char* fname,
                  DataPacket **pkts, mcast_t *mcast, uint32_t *file_completion_masks, int *discovered_ids){ 
 
-    printf("DEBUGING: sending control \n");
+    //printf("DEBUGING: sending control \n");
 
     // create the control packet to dictate the shape of this file
     long ctrl_len = sizeof(ControlPacket) + strlen(fname) + 1;
@@ -139,15 +143,16 @@ void send_file(int tot_files, int fid, int tot_chunk, int csize, char* fname,
     int max_ack_size = sizeof(packet_t) + sizeof(Ack) + 100;
     packet_t *recv_pkt = malloc(max_ack_size); 
 
-    printf(">> Discovery Phase: Sending Control packet...\n");
+    //printf(">> Discovery Phase: Sending Control packet...\n");
     
     // Send CTRL packet
     multicast_send(mcast, meta_package, sizeof(packet_t) + ctrl_len);
+    total_packets_sent++;
 
     // Wait and listen for JOIN_ACKS
     time_t start_time = time(NULL);
     // Wait 2 seconds for everyone to check in
-    while (time(NULL) - start_time < 2) { 
+    while (time(NULL) - start_time < .5) { 
         if (multicast_check_receive(mcast) > 0) {
             multicast_receive(mcast, recv_pkt, 1000);
             Ack *in = (Ack*)recv_pkt->payload;
@@ -186,22 +191,25 @@ void send_file(int tot_files, int fid, int tot_chunk, int csize, char* fname,
 
         // Check if everyone we know about has finished THIS specific file
         if (master_receiver_mask != 0 && (file_completion_masks[fid] & master_receiver_mask) == master_receiver_mask) {
-            printf(">> All known receivers finished File %d. Moving on.\n", fid);
+            //printf(">> All known receivers finished File %d. Moving on.\n", fid);
             break; 
         }
 
         // If we still have new chunks to send, send one
         if (cur_idx < tot_chunk) {
+            /*
             printf("~~~~~~~~~~~~~~~DEBUGING~~~~~~~~~~~~~~~~~~\n");
             printf("sending chunk %d \n", cur_idx);
             printf("struct size %ld \n", sizeof(DataPacket));
             printf("data size %ld \n", pkts[cur_idx]->data_size);
             printf("~~~~~~~~~~~~~~~~~END~~~~~~~~~~~~~~~~~~\n");
+            */
             send_chunk(cur_idx, pkts, mcast, envelope);
             cur_idx++;
         } else {
             multicast_send(mcast, p_eof, eof_size); // Heartbeat
-            usleep(100000); 
+            total_packets_sent++;
+            usleep(1000); 
         }
 
         while (multicast_check_receive(mcast) > 0) {
@@ -218,21 +226,21 @@ void send_file(int tot_files, int fid, int tot_chunk, int csize, char* fname,
             } 
             else if (in->ack_type == 2) { // FINISHED
                 if (bit_pos != -1) {
-                    printf("File %d: Receiver %d (Bit %d) is FINISHED.\n", in->ack_no, in->originator_id, bit_pos);
+                    //printf("File %d: Receiver %d (Bit %d) is FINISHED.\n", in->ack_no, in->originator_id, bit_pos);
                     file_completion_masks[in->ack_no] |= (1 << bit_pos);
                 }
             }
             else if (in->ack_type == 3) { // REQUEST_CTRL (Late Joiner)
                 // Send the Control Packet so they can initialize
                 multicast_send(mcast, meta_package, sizeof(packet_t) + ctrl_len);
+                total_packets_sent++;
             }
         }
 
         // for safety: if no one is listening
         // break out of loop
-        if (master_receiver_mask == 0 && time(NULL) - start_time > 5) break;
+        if (master_receiver_mask == 0 && time(NULL) - start_time > 3) break;
 
-        usleep(1000);
     }
     free(envelope);
     free(meta_package);
@@ -245,7 +253,7 @@ void send_chunk(int chunk_no, DataPacket **pkts, mcast_t *mcast, packet_t *envel
     envelope->type = DATA;
     memcpy(envelope->payload, pkts[chunk_no], payload_len);
     multicast_send(mcast, envelope, sizeof(packet_t) + payload_len);
-    
+    total_packets_sent++;
 }
 
 // return true if id is in list
@@ -380,6 +388,9 @@ int main(int argc, char const* argv[]){
 
     bool all_batch_done = false;
 
+    struct timespec start_total, end_total;
+    clock_gettime(CLOCK_MONOTONIC, &start_total); // Start Clock    
+
     while (!all_batch_done) {
         all_batch_done = true; // Assume we are done until proven otherwise
 
@@ -388,15 +399,15 @@ int main(int argc, char const* argv[]){
             if ((file_completion_masks[i] & master_receiver_mask) != master_receiver_mask || master_receiver_mask == 0) {
                 
                 all_batch_done = false; // Someone is missing it, so the batch isn't done
-                printf(">> Carousel: File %d is missing ACKs. Re-sending...\n", i);
+                //printf(">> Carousel: File %d is missing ACKs. Re-sending...\n", i);
 
                 // start processing
-                printf(">> Currently sending %s \n", files[i]);
+                //printf(">> Currently sending %s \n", files[i]);
 
-                printf("~~~~~~~~~~~~~~~DEBUGING~~~~~~~~~~~~~~~~~~\n");
-                printf("file %d \n", i);
-                printf("tot chunks %d \n", file_len[i]);
-                printf("~~~~~~~~~~~~~~~~~END~~~~~~~~~~~~~~~~~~\n");
+                //printf("~~~~~~~~~~~~~~~DEBUGING~~~~~~~~~~~~~~~~~~\n");
+                //printf("file %d \n", i);
+                //printf("tot chunks %d \n", file_len[i]);
+                //printf("~~~~~~~~~~~~~~~~~END~~~~~~~~~~~~~~~~~~\n");
                 
                 send_file(tot_files, i, file_len[i], chunk_size, files[i], file_chunks[i], cast, file_completion_masks, discovered_ids);
                 
@@ -404,12 +415,23 @@ int main(int argc, char const* argv[]){
         }
 
         if (!all_batch_done) {
-            printf(">> Loop complete, but some receivers not receieved all files yet. Starting next pass...\n");
+            //printf(">> Loop complete, but some receivers not receieved all files yet. Starting next pass...\n");
             sleep(2); // Prevent slamming the CPU/Network
         }
     }
 
-    printf("SUCCESS: All known receivers have confirmed all files. Closing sender.\n");
+    // track statistics
+
+    clock_gettime(CLOCK_MONOTONIC, &end_total); // Stop Clock
+
+    double total_latency = (end_total.tv_sec - start_total.tv_sec) + 
+                        (end_total.tv_nsec - start_total.tv_nsec) / 1000000000.0;
+    double pps = total_packets_sent / total_latency;
+
+    printf(">> TRANSMISSION COMPLETE <<\n");
+    printf("All known receivers have confirmed all files. Closing sender.\n");
+    printf("Total End-to-End Latency: %.3f seconds\n", total_latency);
+    printf("Average Throughput: %.2f packets/sec\n", pps);
     
     // free all resources
     for (int i = 0; i < tot_files; i++) {
