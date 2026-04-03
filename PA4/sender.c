@@ -318,6 +318,19 @@ int main(int argc, char const* argv[]){
             continue;
 
         } else {
+            // duplicate file check
+            bool is_duplicate = false;
+            for (int j = 0; j < tot_files; j++) {
+                if (strcmp(files[j], argv[i]) == 0) {
+                    printf(">> Warning: Skipping duplicate file path: %s\n", argv[i]);
+                    is_duplicate = true;
+                    break;
+                }
+            }
+            if (is_duplicate) {
+                fclose(fptr); 
+                continue;     
+            }
             // can read --> prepare to multicast
             printf(">> Chunking and processing file %s \n", argv[i]);
 

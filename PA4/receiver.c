@@ -335,7 +335,6 @@ void listener(mcast_t* mcast){
             memset(pkt, '\0', sizeof(packet_t) + max_payload);   
         }
     }
-
 }
 
 
