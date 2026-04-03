@@ -35,6 +35,7 @@ typedef struct ControlPacket{
     int tot_chunk; // total number of chunks for file_name
     int chunk_size;
     long file_size;
+    int total_file_checksum;
     // int file_checksum; --> could use to validate final file
     char file_name[];
 
@@ -45,7 +46,7 @@ typedef struct ControlPacket{
 typedef struct Ack{
     int originator_id; // an id number to differentiate who sent this ack 
     int ack_type; // 1 = NACK/RESEND, 2 = FINISHED, 3 = REQUEST_CTRL, 5 = JOIN_ACK, 9 = SENDER_FINISHED_SIGNAL
-    int ack_no; // packet missing
+    int ack_no; // packet or file
 
 } Ack;
 

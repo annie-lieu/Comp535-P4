@@ -119,6 +119,18 @@ void send_file(int tot_files, int fid, int tot_chunk, int csize, char* fname,
 
     //printf("DEBUGING: sending control \n");
 
+    // get file checksum value
+    FILE *fp = fopen(fname, "rb");
+    fseek(fp, 0, SEEK_END);
+    size_t file_size = ftell(fp);
+    rewind(fp);
+    unsigned char *temp_buffer = malloc(file_size);
+    fread(temp_buffer, 1, file_size, fp);
+    uint8_t master_checksum = checksum(temp_buffer, file_size);
+    free(temp_buffer);
+    fclose(fp);
+    //printf("Total Checksum value: %d\n", master_checksum);
+
     // create the control packet to dictate the shape of this file
     long ctrl_len = sizeof(ControlPacket) + strlen(fname) + 1;
     long fsize = get_file_size(fname);
@@ -128,6 +140,7 @@ void send_file(int tot_files, int fid, int tot_chunk, int csize, char* fname,
     c->tot_chunk = tot_chunk;
     c->chunk_size = csize;
     c->file_size = fsize;
+    c->total_file_checksum = master_checksum;
     // get absolute path name
     const char *pure_name = strrchr(fname, '/');
     if (pure_name) pure_name++;
@@ -176,7 +189,6 @@ void send_file(int tot_files, int fid, int tot_chunk, int csize, char* fname,
     Ack eof_signal;
     eof_signal.ack_type = 9;         
     eof_signal.originator_id = 0;
-    // Helpful for receivers to verify the goal    
     eof_signal.ack_no = tot_chunk;  
 
     // Wrap it in the packet_t shell

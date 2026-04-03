@@ -59,7 +59,21 @@ void reassemble_file(DataPacket *pkt, int location){
 
     // Check for completion
     if (chunks_count == cur_file_info->tot_chunk) {
-        write_flag = 1;
+        // find checksum for whole file
+        uint8_t final_integrity = checksum(file_buf, cur_file_info->file_size);
+
+        if (final_integrity == cur_file_info->total_file_checksum) {
+            printf("Integrity Verified for %s\n", cur_file_info->file_name);
+            write_flag = 1;
+        } else {
+            printf("Checksum Mismatch! Got: 0x%02X, Expected: 0x%02X\n", 
+                    final_integrity, cur_file_info->total_file_checksum);
+            memset(file_buf, 0, cur_file_info->tot_chunk * cur_file_info->chunk_size);
+            
+            // Reset state so the Carousel can try again
+            memset(received_chunks, 0, cur_file_info->tot_chunk * sizeof(int));
+            chunks_count = 0;
+        }
     }
 }
 
@@ -325,7 +339,9 @@ void listener(mcast_t* mcast){
                             send_ack_to_sender(mcast, done); 
                             
                             // Trigger the file write if not already done
-                            if (file_buf != NULL) write_flag = 1;
+                            if (file_buf != NULL) {
+                                write_flag = 1;
+                            }
                         } else {
                             // request missing chunk
 
