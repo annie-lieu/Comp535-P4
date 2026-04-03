@@ -8,9 +8,12 @@
 #include <sys/stat.h>
 #include "packet.h"
 
+#define MAX_RECEIVERS 32
+
 // counts the current number of receivers in the multicast
 //  --> we increase this count when we receive some ACK (or NACK) from a reciever with a different ID
-int receiver_num = 0; 
+int total_unique_count = 0;              // To track if we've found anyone at all
+uint32_t master_receiver_mask = 0;       // Bits set for every ID we've EVER seen
 
 
 // SUMMARY OF TODO:
@@ -86,11 +89,29 @@ DataPacket** chunk_file(int csize, int tot_chunk, int fid, const char* fname){
     return data_pkts;
 }
 
+int get_bit_index(int id, int *list) {
+    // 1. Check if we already know this ID
+    for (int i = 0; i < total_unique_count; i++) {
+        if (list[i] == id) {
+            return i; // Use this index as the bit position
+        }
+    }
+
+    // 2. If it's a new ID, add it to the list
+    if (total_unique_count < 32) {
+        list[total_unique_count] = id;
+        printf("New Receiver Registered: ID %d at Bit %d\n", id, total_unique_count);
+        return total_unique_count++; 
+    }
+
+    return -1; // Too many receivers 
+}
+
 
 
 // a function to send those chunks and check for ACK + handles retransmission
 void send_file(int tot_files, int fid, int tot_chunk, int csize, char* fname,
-                 DataPacket **pkts, mcast_t *mcast){ 
+                 DataPacket **pkts, mcast_t *mcast, uint32_t *file_completion_masks, int *discovered_ids){ 
 
     printf("DEBUGING: sending control \n");
 
@@ -115,16 +136,8 @@ void send_file(int tot_files, int fid, int tot_chunk, int csize, char* fname,
     meta_package->type = CTRL;
     memcpy(meta_package->payload, c, ctrl_len);
 
-    // send the intial control packet
-    multicast_send(mcast, meta_package, sizeof(packet_t) + ctrl_len);    
-
     int max_ack_size = sizeof(packet_t) + sizeof(Ack) + 100;
     packet_t *recv_pkt = malloc(max_ack_size); 
-
-    receiver_num = 0; 
-    // Simple array to track unique IDs
-    int *discovered_ids = calloc(1024, sizeof(int)); 
-    memset(discovered_ids, 0, 1024 * sizeof(int));
 
     printf(">> Discovery Phase: Sending Control packet...\n");
     
@@ -140,10 +153,9 @@ void send_file(int tot_files, int fid, int tot_chunk, int csize, char* fname,
             Ack *in = (Ack*)recv_pkt->payload;
             
             if (in->ack_type == 5) {
-                if (!is_id_in_list(discovered_ids, receiver_num, in->originator_id)) {
-                    discovered_ids[receiver_num] = in->originator_id;
-                    receiver_num++;
-                    printf("Found Receiver ID: %d (Total: %d)\n", in->originator_id, receiver_num);
+                int bit_pos = get_bit_index(in->originator_id, discovered_ids);
+                if (bit_pos != -1) {
+                    master_receiver_mask |= (1 << bit_pos); // Flip their switch to "Required"
                 }
             }
         }
@@ -152,19 +164,17 @@ void send_file(int tot_files, int fid, int tot_chunk, int csize, char* fname,
     // sending the data packets (sucessfully sent control packet)
     int cur_idx = 0; // min seq chunk to send
 
-    int finished_count = 0;
-    int finished_receivers[1024] = {0};
     int max_data_pkt_size = sizeof(packet_t) + sizeof(DataPacket) + csize;
     packet_t *envelope = malloc(max_data_pkt_size);
 
-    // 1. Create the inner payload (The Signal)
+    // Create the inner payload (The Signal)
     Ack eof_signal;
     eof_signal.ack_type = 9;         
     eof_signal.originator_id = 0;
     // Helpful for receivers to verify the goal    
     eof_signal.ack_no = tot_chunk;  
 
-    // 2. Wrap it in the packet_t shell
+    // Wrap it in the packet_t shell
     packet_t *p_eof = malloc(sizeof(packet_t) + sizeof(Ack));
     p_eof->type = ACKN;            
     memcpy(p_eof->payload, &eof_signal, sizeof(Ack));
@@ -172,9 +182,14 @@ void send_file(int tot_files, int fid, int tot_chunk, int csize, char* fname,
     // Size to send
     int eof_size = sizeof(packet_t) + sizeof(Ack);
 
-    // loop until All receivers finished receiving current file
-    while (finished_count < receiver_num) {
-        
+    while (true) {
+
+        // Check if everyone we know about has finished THIS specific file
+        if (master_receiver_mask != 0 && (file_completion_masks[fid] & master_receiver_mask) == master_receiver_mask) {
+            printf(">> All known receivers finished File %d. Moving on.\n", fid);
+            break; 
+        }
+
         // If we still have new chunks to send, send one
         if (cur_idx < tot_chunk) {
             printf("~~~~~~~~~~~~~~~DEBUGING~~~~~~~~~~~~~~~~~~\n");
@@ -185,43 +200,40 @@ void send_file(int tot_files, int fid, int tot_chunk, int csize, char* fname,
             send_chunk(cur_idx, pkts, mcast, envelope);
             cur_idx++;
         } else {
-            // We finished the file, now just heartbeat until everyone is done
-            multicast_send(mcast, p_eof, eof_size); 
+            multicast_send(mcast, p_eof, eof_size); // Heartbeat
             usleep(100000); 
         }
 
-        // Check for ANY incoming ACKs (NACKs or FINISHED)
         while (multicast_check_receive(mcast) > 0) {
             multicast_receive(mcast, recv_pkt, max_ack_size);
             Ack *in = (Ack*)recv_pkt->payload;
+
+            int bit_pos = get_bit_index(in->originator_id, discovered_ids);
+            if (bit_pos != -1) {
+                master_receiver_mask |= (1 << bit_pos);
+            }
 
             if (in->ack_type == 1) { // NACK
                 send_chunk(in->ack_no, pkts, mcast, envelope);
             } 
             else if (in->ack_type == 2) { // FINISHED
-                if (is_id_in_list(discovered_ids, receiver_num, in->originator_id) && 
-                    finished_receivers[in->originator_id] == 0) {
-                    finished_receivers[in->originator_id] = 1;
-                    finished_count++;
-                    printf("Receiver %d finished (%d/%d)\n", in->originator_id, finished_count, receiver_num);
+                if (bit_pos != -1) {
+                    printf("File %d: Receiver %d (Bit %d) is FINISHED.\n", in->ack_no, in->originator_id, bit_pos);
+                    file_completion_masks[in->ack_no] |= (1 << bit_pos);
                 }
             }
             else if (in->ack_type == 3) { // REQUEST_CTRL (Late Joiner)
-                // 1. Send the Control Packet so they can initialize
+                // Send the Control Packet so they can initialize
                 multicast_send(mcast, meta_package, sizeof(packet_t) + ctrl_len);
-
-                // Check if we already know this person
-                if (!is_id_in_list(discovered_ids, receiver_num, in->originator_id)) {
-                    discovered_ids[receiver_num] = in->originator_id;
-                    receiver_num++; 
-                    printf("Late Joiner Registered: ID %d (New Total: %d)\n", 
-                            in->originator_id, receiver_num);
-                }
             }
         }
+
+        // for safety: if no one is listening
+        // break out of loop
+        if (master_receiver_mask == 0 && time(NULL) - start_time > 5) break;
+
         usleep(1000);
     }
-
     free(envelope);
     free(meta_package);
     free(recv_pkt);
@@ -343,35 +355,49 @@ int main(int argc, char const* argv[]){
         }
 
     }
+    int *discovered_ids = calloc(1024, sizeof(int));
+
+    uint32_t file_completion_masks[tot_files];
+    memset(file_completion_masks, 0, sizeof(file_completion_masks));
 
     // initializing sockets for multicasting
     mcast_t *cast = multicast_init("239.2.2.2", 5000, 4000); // send and receive on different ports
 
     multicast_setup_recv(cast);
-    
 
-    // multicasting the processed files
-    for (int i = 0; i < tot_files; i++){
-        
-        // start processing
-        printf(">> Currently sending %s \n", files[i]);
+    bool all_batch_done = false;
 
-        printf("~~~~~~~~~~~~~~~DEBUGING~~~~~~~~~~~~~~~~~~\n");
-        printf("file %d \n", i);
-        printf("tot chunks %d \n", file_len[i]);
-        printf("~~~~~~~~~~~~~~~~~END~~~~~~~~~~~~~~~~~~\n");
+    while (!all_batch_done) {
+        all_batch_done = true; // Assume we are done until proven otherwise
 
-        // sending
-        send_file(tot_files, i, file_len[i], chunk_size, files[i], file_chunks[i], cast);
-        sleep(2);
+        for (int i = 0; i < tot_files; i++) {
+            // Check if anyone is missing this specific file
+            if ((file_completion_masks[i] & master_receiver_mask) != master_receiver_mask || master_receiver_mask == 0) {
+                
+                all_batch_done = false; // Someone is missing it, so the batch isn't done
+                printf(">> Carousel: File %d is missing ACKs. Re-sending...\n", i);
 
+                // start processing
+                printf(">> Currently sending %s \n", files[i]);
+
+                printf("~~~~~~~~~~~~~~~DEBUGING~~~~~~~~~~~~~~~~~~\n");
+                printf("file %d \n", i);
+                printf("tot chunks %d \n", file_len[i]);
+                printf("~~~~~~~~~~~~~~~~~END~~~~~~~~~~~~~~~~~~\n");
+                
+                send_file(tot_files, i, file_len[i], chunk_size, files[i], file_chunks[i], cast, file_completion_masks, discovered_ids);
+                
+            }
+        }
+
+        if (!all_batch_done) {
+            printf(">> Loop complete, but some receivers not receieved all files yet. Starting next pass...\n");
+            sleep(2); // Prevent slamming the CPU/Network
+        }
     }
 
-    // finished sending files
-    // TODO: get ready to terminate after confirming all current recievers got the files
-
-
-
+    printf("SUCCESS: All known receivers have confirmed all files. Closing sender.\n");
+    
     // free all resources
     for (int i = 0; i < tot_files; i++) {
         for (int j = 0; j < file_len[i]; j++){
@@ -383,6 +409,7 @@ int main(int argc, char const* argv[]){
 
     }
 
+    free(discovered_ids);
     free(files);
     free(file_chunks);
     

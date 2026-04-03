@@ -123,6 +123,7 @@ void verify_chunk(DataPacket *pkt, mcast_t* mcast){
             if (file_buf != NULL) {
                 // Write the current file to disk
                 if (write_file()) { 
+                    files_completed++;
                     
                     // Prepare and send the finished ACK
                     Ack final_ack;
@@ -220,31 +221,46 @@ void listener(mcast_t* mcast){
             // parse packet type
             switch(pkt->type) {
                 case DATA:
-                    //check if we received the control packet
-                    if (!file_buf){
-
-                        // no buffer -> ask for ctrl packet from sender
-
-                        printf("Received data but missing Control Packet. Requesting...\n");
-                        
-                        Ack nack;
-                        nack.originator_id = recv_id;
-                        nack.ack_type = 3;
-                        
-                        send_ack_to_sender(mcast, nack);
-
+                    if (!file_buf) {
+                        // ask for ctrl packet
+                        static time_t last_request = 0;
+                        if (time(NULL) - last_request > 1) { // Only ask once per second
+                            printf("Received data but missing Control Packet. Requesting...\n");
+                            Ack nack = { .originator_id = recv_id, .ack_type = 3, .ack_no = 0 };
+                            send_ack_to_sender(mcast, nack);
+                            last_request = time(NULL);
+                        }
                     } else {
-                        // proceed with checking the chunk
                         verify_chunk((DataPacket *) pkt->payload, mcast);
-
                     }
                     break;
                 case CTRL:
 
                     ControlPacket *incoming = (ControlPacket*)pkt->payload;
 
+                    if (cur_file_info == NULL) {
+                        cur_file_info = calloc(1, sizeof(ControlPacket) + 256);
+                    }
+                    memcpy(cur_file_info, incoming, sizeof(ControlPacket) + 256);
+
+                    // SCENARIO: WE ALREADY FINISHED THIS FILE
+                    char path[1024];
+                    snprintf(path, sizeof(path), "%s/%s", dir_name, incoming->file_name);
+                    
+                    if (access(path, F_OK) == 0) {
+                        printf("Carousel: Already have %s. Sending ACK and ignoring.\n", incoming->file_name);
+                        Ack already_done = { .originator_id = recv_id, .ack_type = 2, .ack_no = incoming->file_id };
+                        send_ack_to_sender(mcast, already_done);
+                        break; // Exit the switch case, don't allocate or reset
+                        if (file_buf != NULL) {
+                            free(file_buf);
+                            file_buf = NULL;
+                        }
+                        break;
+                    }
+
                     // SCENARIO: No buffer OR it's a brand new File ID
-                    if (file_buf == NULL || (cur_file_info != NULL && incoming->file_id > cur_file_info->file_id)) { 
+                    if (file_buf == NULL || (cur_file_info != NULL && incoming->file_id != cur_file_info->file_id)) { 
                         
                         // If we had a buffer from a previous file that didn't finish, clean it up first
                         if (file_buf != NULL) {
@@ -285,20 +301,29 @@ void listener(mcast_t* mcast){
                     // the sender has information for the receiver (e.g. finished transmiting and want to shutdown)
                     Ack *in_signal = (Ack*)pkt->payload;
 
+                    // PROTECTION: If we don't have metadata, we can't process heartbeats
+                    if (cur_file_info == NULL) {
+                        printf("Received Heartbeat but missing metadata. Requesting Control Packet...\n");
+                        Ack req = { .originator_id = recv_id, .ack_type = 3, .ack_no = 0 };
+                        send_ack_to_sender(mcast, req);
+                        break; 
+                    }
+
                     if (in_signal->ack_type == 9) { // Sender says they are done
                         if (chunks_count == (cur_file_info->tot_chunk)) {
                             // every chunk recieved
                             Ack done;
                             done.originator_id = recv_id;
-                            done.ack_type = 2; 
+                            done.ack_type = 2;
+                            done.ack_no = cur_file_info->file_id; 
                             
                             // send done packet back to sender
                             send_ack_to_sender(mcast, done); 
                             
                             // Trigger the file write if not already done
-                            write_flag = 1; 
+                            if (file_buf != NULL) write_flag = 1;
                         } else {
-                            // missing chunk -> request chunk
+                            // request missing chunk
 
                             send_nack(mcast, find_first_missing_chunk());
                         }
